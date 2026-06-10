@@ -25,7 +25,7 @@
 
 set -u
 
-VERSION="3.0.0-universal"
+VERSION="3.0.1-universal"
 OFFICIAL_SCRIPT_URL="${OFFICIAL_SCRIPT_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh}"
 OFFICIAL_CONFIG_URL="${OFFICIAL_CONFIG_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/config.conf}"
 WORK_DIR="${WORK_DIR:-/root/.sb-guide}"
@@ -409,50 +409,104 @@ run_pkg() {
   sh -c "$*"
 }
 
+install_optional_ethtool() {
+  # ethtool is only used for best-effort GRO/GSO/TSO tuning on a full VM or
+  # bare-metal host. It is not a hard dependency, and installing it must never
+  # abort sing-box installation.
+  if [ "${IS_CONTAINER:-false}" = "true" ]; then
+    info "容器环境跳过可选依赖 ethtool；虚拟网卡卸载能力通常由宿主机控制。"
+    return 0
+  fi
+
+  if has ethtool; then
+    return 0
+  fi
+
+  info "尝试安装可选依赖 ethtool；失败不会中止安装。"
+  case "$PM" in
+    apt)
+      run_pkg "apt-get install -y --no-install-recommends ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    apk)
+      run_pkg "apk add --no-cache ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    dnf)
+      run_pkg "dnf install -y ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    yum)
+      run_pkg "yum install -y ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    microdnf)
+      run_pkg "microdnf install -y ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    pacman)
+      run_pkg "pacman -S --noconfirm --needed ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    zypper)
+      run_pkg "zypper --non-interactive install ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    xbps)
+      run_pkg "xbps-install -Sy ethtool" ||
+        warn "可选依赖 ethtool 安装失败，跳过网卡卸载参数调整。"
+      ;;
+    *)
+      warn "当前包管理器未配置 ethtool 自动安装；继续执行。"
+      ;;
+  esac
+}
+
 install_deps() {
   say
-  info "安装最小依赖，不安装编译器、内核或大型面板。"
+  info "安装核心依赖；可选调优工具单独安装，失败不会阻断主流程。"
 
   case "$PM" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
       run_pkg "apt-get update" || die "apt-get update 失败"
-      run_pkg "apt-get install -y --no-install-recommends bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool" ||
-        die "依赖安装失败"
+      run_pkg "apt-get install -y --no-install-recommends bash curl wget ca-certificates tar gzip openssl iproute2 procps" ||
+        die "核心依赖安装失败"
       ;;
     apk)
       run_pkg "apk update" || die "apk update 失败"
-      run_pkg "apk add --no-cache bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool-ng openrc ethtool" ||
-        die "依赖安装失败"
+      # Alpine 正确包名是 procps-ng 和 ethtool；不存在 ethtool-ng。
+      run_pkg "apk add --no-cache bash curl wget ca-certificates tar gzip openssl iproute2 procps-ng openrc" ||
+        die "核心依赖安装失败"
       update-ca-certificates >/dev/null 2>&1 || true
       ;;
     dnf)
-      run_pkg "dnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool" ||
-        die "依赖安装失败"
+      run_pkg "dnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng" ||
+        die "核心依赖安装失败"
       ;;
     yum)
-      if ! run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool"; then
+      if ! run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng"; then
         run_pkg "yum install -y epel-release" || true
-        run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool" ||
-          die "依赖安装失败"
+        run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng" ||
+          die "核心依赖安装失败"
       fi
       ;;
     microdnf)
-      run_pkg "microdnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool" ||
-        die "依赖安装失败"
+      run_pkg "microdnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng" ||
+        die "核心依赖安装失败"
       ;;
     pacman)
-      run_pkg "pacman -Sy --noconfirm --needed bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool-ng" ||
-        die "依赖安装失败"
+      run_pkg "pacman -Sy --noconfirm --needed bash curl wget ca-certificates tar gzip openssl iproute2 procps-ng" ||
+        die "核心依赖安装失败"
       ;;
     zypper)
       run_pkg "zypper --non-interactive refresh" || true
-      run_pkg "zypper --non-interactive install bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool" ||
-        die "依赖安装失败"
+      run_pkg "zypper --non-interactive install bash curl wget ca-certificates tar gzip openssl iproute2 procps" ||
+        die "核心依赖安装失败"
       ;;
     xbps)
-      run_pkg "xbps-install -Sy bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool-ng" ||
-        die "依赖安装失败"
+      run_pkg "xbps-install -Sy bash curl wget ca-certificates tar gzip openssl iproute2 procps-ng" ||
+        die "核心依赖安装失败"
       ;;
     opkg)
       run_pkg "opkg update" || true
@@ -460,9 +514,12 @@ install_deps() {
         warn "OpenWrt 依赖未完全安装；上游安装器也可能不支持此系统。"
       ;;
     *)
-      warn "跳过自动安装。至少需要：bash、curl 或 wget、CA 证书、tar、gzip、openssl。"
+      warn "未识别包管理器，跳过自动安装。"
+      warn "至少需要：bash、curl 或 wget、CA 证书、tar、gzip、openssl。"
       ;;
   esac
+
+  install_optional_ethtool
 
   has bash || die "没有 bash；上游安装器必须使用 bash。"
   if ! has curl && ! has wget; then
@@ -1570,6 +1627,8 @@ main() {
       say "  SB_TRANSPORT_MODE=tcp|udp|auto"
       say "  SB_PROFILE=auto|lean|compat|custom|all"
       say "  SB_NAT_LIMITED=true|false"
+      say
+      say "兼容修复：Alpine 使用 procps-ng / ethtool；ethtool 为可选依赖。"
       exit 0
       ;;
     --auto-tcp|auto-tcp)
@@ -1624,6 +1683,8 @@ main() {
       say "  SB_TRANSPORT_MODE=tcp|udp|auto"
       say "  SB_PROFILE=auto|lean|compat|custom|all"
       say "  SB_NAT_LIMITED=true|false"
+      say
+      say "兼容修复：Alpine 使用 procps-ng / ethtool；ethtool 为可选依赖。"
       exit 0
       ;;
     install|"")
