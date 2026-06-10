@@ -25,7 +25,7 @@
 
 set -u
 
-VERSION="3.0.1-universal"
+VERSION="3.0.3-upstream-clean"
 OFFICIAL_SCRIPT_URL="${OFFICIAL_SCRIPT_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh}"
 OFFICIAL_CONFIG_URL="${OFFICIAL_CONFIG_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/config.conf}"
 WORK_DIR="${WORK_DIR:-/root/.sb-guide}"
@@ -1053,6 +1053,62 @@ EOF
   ok "配置已写入：$CONFIG_PATH（权限 600）"
 }
 
+
+alpine_openrc_preflight() {
+  [ "${OS_ID:-}" = "alpine" ] || return 0
+
+  # Minimal LXC images sometimes have OpenRC installed but no runtime marker.
+  # Creating softlevel is the conventional way to make rc-service usable in
+  # an already-running container; no kernel/init replacement is attempted.
+  mkdir -p /run/openrc 2>/dev/null || true
+  [ -e /run/openrc/softlevel ] || : > /run/openrc/softlevel 2>/dev/null || true
+
+  if ! has rc-service || ! has rc-update; then
+    die "Alpine 缺少 rc-service/rc-update；请确认 openrc 已安装。"
+  fi
+
+  ok "Alpine OpenRC 运行环境预检完成。"
+}
+
+file_sha256() {
+  file="$1"
+  if has sha256sum; then
+    sha256sum "$file" | awk '{print $1}'
+  elif has openssl; then
+    openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}'
+  else
+    printf "unavailable
+"
+  fi
+}
+
+print_install_failure_diagnostics() {
+  say
+  warn "安装失败诊断："
+
+  if [ "${OS_ID:-}" = "alpine" ]; then
+    if has rc-service; then
+      rc-service sing-box status 2>&1 || true
+    fi
+    [ -e /run/openrc/softlevel ] &&
+      info "/run/openrc/softlevel：存在" ||
+      warn "/run/openrc/softlevel：不存在"
+  fi
+
+  [ -e /etc/init.d/sing-box ] &&
+    ls -l /etc/init.d/sing-box 2>/dev/null || true
+  [ -e /etc/sing-box/sing-box ] &&
+    ls -lh /etc/sing-box/sing-box 2>/dev/null || true
+
+  if grep -q 'Sing-box 关闭 失败' "$LOG_PATH" 2>/dev/null; then
+    warn "上游日志显示服务停止失败；本包装脚本没有修改或绕过该上游逻辑。"
+  fi
+
+  if grep -q 'grep: warning: stray \\ before -' "$LOG_PATH" 2>/dev/null; then
+    warn "日志包含 BusyBox grep 的兼容警告；为保持上游原样，本脚本没有改写该语句。"
+  fi
+}
+
 download_official_script() {
   info "下载上游安装器：$OFFICIAL_SCRIPT_URL"
   fetch_file "$OFFICIAL_SCRIPT_URL" "$OFFICIAL_SCRIPT_PATH" ||
@@ -1068,11 +1124,18 @@ download_official_script() {
     *) warn "上游脚本首行不是常见 Bash shebang，请人工检查：$OFFICIAL_SCRIPT_PATH" ;;
   esac
 
-  ok "上游脚本已下载并通过语法检查。"
+  # Only prepare the host environment. The downloaded upstream file is never
+  # edited, patched, reformatted or sourced by this wrapper.
+  alpine_openrc_preflight
+
+  UPSTREAM_SHA256_BEFORE="$(file_sha256 "$OFFICIAL_SCRIPT_PATH")"
+  info "原版上游脚本 SHA256：$UPSTREAM_SHA256_BEFORE"
+  ok "上游安装器保持原始内容，未做任何源码修改。"
 }
 
 run_install() {
-  info "开始安装；日志：$LOG_PATH"
+  info "开始调用原版上游安装器；日志：$LOG_PATH"
+  info "调用方式：bash <official-sing-box.sh> -f <generated-config.conf>"
   rm -f "$LOG_PATH"
 
   # Preserve the upstream exit code while still showing live output.
@@ -1087,7 +1150,20 @@ run_install() {
     cat "$LOG_PATH"
   fi
 
-  [ "$rc" -eq 0 ] || die "上游安装器返回错误码 $rc。请查看：$LOG_PATH"
+  UPSTREAM_SHA256_AFTER="$(file_sha256 "$OFFICIAL_SCRIPT_PATH")"
+  if [ "${UPSTREAM_SHA256_BEFORE:-unavailable}" != "unavailable" ] &&
+     [ "$UPSTREAM_SHA256_AFTER" != "$UPSTREAM_SHA256_BEFORE" ]; then
+    warn "上游脚本文件在执行期间发生变化："
+    warn "执行前：$UPSTREAM_SHA256_BEFORE"
+    warn "执行后：$UPSTREAM_SHA256_AFTER"
+  else
+    ok "已确认执行的是未修改的原版上游脚本。"
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    print_install_failure_diagnostics
+    die "原版上游安装器返回错误码 $rc。请查看：$LOG_PATH"
+  fi
 }
 
 service_is_running() {
@@ -1526,7 +1602,7 @@ network_optimize() {
       info "旧配置已备份：$backup"
     fi
     {
-      printf '# Managed by sb-guide-universal.sh v%s
+      printf '# Managed by sb-guide-universal-v3.0.3-upstream-clean.sh v%s
 ' "$VERSION"
       printf '# Resource class: %s; transport: %s
 ' "$RESOURCE_CLASS" "$TRANSPORT_MODE"
@@ -1628,7 +1704,7 @@ main() {
       say "  SB_PROFILE=auto|lean|compat|custom|all"
       say "  SB_NAT_LIMITED=true|false"
       say
-      say "兼容修复：Alpine 使用 procps-ng / ethtool；ethtool 为可选依赖。"
+      say "安装原则：原样下载并执行官方 sing-box.sh；不对上游源码打补丁。"
       exit 0
       ;;
     --auto-tcp|auto-tcp)
@@ -1684,7 +1760,7 @@ main() {
       say "  SB_PROFILE=auto|lean|compat|custom|all"
       say "  SB_NAT_LIMITED=true|false"
       say
-      say "兼容修复：Alpine 使用 procps-ng / ethtool；ethtool 为可选依赖。"
+      say "安装原则：原样下载并执行官方 sing-box.sh；不对上游源码打补丁。"
       exit 0
       ;;
     install|"")
