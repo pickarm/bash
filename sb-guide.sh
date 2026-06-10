@@ -25,7 +25,7 @@
 
 set -u
 
-VERSION="3.0.4-upstream-clean"
+VERSION="3.0.5-upstream-clean"
 OFFICIAL_SCRIPT_URL="${OFFICIAL_SCRIPT_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh}"
 OFFICIAL_CONFIG_URL="${OFFICIAL_CONFIG_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/config.conf}"
 WORK_DIR="${WORK_DIR:-/root/.sb-guide}"
@@ -1054,6 +1054,37 @@ EOF
 }
 
 
+clear_openrc_runtime_state() {
+  service_name="${1:-sing-box}"
+
+  # OpenRC stores transient service state below /run/openrc. Deleting the
+  # init script alone does not clear a previous "crashed" marker.
+  if has rc-service && [ -f "/etc/init.d/${service_name}" ]; then
+    rc-service "$service_name" zap >/dev/null 2>&1 || true
+  fi
+
+  for state_dir in \
+    daemons \
+    started \
+    failed \
+    exclusive \
+    options \
+    scheduled \
+    stopping \
+    starting \
+    inactive \
+    wasinactive
+  do
+    rm -rf "/run/openrc/${state_dir}/${service_name}" 2>/dev/null || true
+  done
+
+  # Some OpenRC versions keep per-service state in additional directories.
+  if has find && [ -d /run/openrc ]; then
+    find /run/openrc -mindepth 2 -maxdepth 2 -name "$service_name" \
+      -exec rm -rf '{}' ';' 2>/dev/null || true
+  fi
+}
+
 alpine_openrc_preflight() {
   [ "${OS_ID:-}" = "alpine" ] || return 0
 
@@ -1065,6 +1096,12 @@ alpine_openrc_preflight() {
 
   if ! has rc-service || ! has rc-update; then
     die "Alpine 缺少 rc-service/rc-update；请确认 openrc 已安装。"
+  fi
+
+  if [ ! -f /etc/init.d/sing-box ] &&
+     ! find_singbox_binary >/dev/null 2>&1; then
+    clear_openrc_runtime_state sing-box
+    info "已清理无有效安装对应的 OpenRC 临时状态。"
   fi
 
   ok "Alpine OpenRC 运行环境预检完成。"
@@ -1134,7 +1171,9 @@ download_official_script() {
 }
 
 run_install() {
-  info "开始调用原版上游安装器；日志：$LOG_PATH"
+  INSTALL_ATTEMPT="${INSTALL_ATTEMPT:-1}"
+
+  info "开始调用原版上游安装器（第 ${INSTALL_ATTEMPT} 次）；日志：$LOG_PATH"
   info "调用方式：bash <official-sing-box.sh> -f <generated-config.conf>"
   rm -f "$LOG_PATH"
 
@@ -1160,10 +1199,37 @@ run_install() {
     ok "已确认执行的是未修改的原版上游脚本。"
   fi
 
-  if [ "$rc" -ne 0 ]; then
-    print_install_failure_diagnostics
-    die "原版上游安装器返回错误码 $rc。请查看：$LOG_PATH"
+  if [ "$rc" -eq 0 ]; then
+    return 0
   fi
+
+  # Alpine/OpenRC can retain a stale "crashed" state after an interrupted
+  # installation. Recover externally and retry the untouched upstream script
+  # once. Never loop indefinitely.
+  if [ "${OS_ID:-}" = "alpine" ] &&
+     [ "$INSTALL_ATTEMPT" -eq 1 ] 2>/dev/null &&
+     grep -q 'Sing-box 关闭 失败' "$LOG_PATH" 2>/dev/null; then
+    first_log="${WORK_DIR}/install-attempt-1.log"
+    cp "$LOG_PATH" "$first_log" 2>/dev/null || true
+
+    warn "检测到 Alpine/OpenRC 残留的 crashed 状态。"
+    warn "将备份本次半安装文件、清理 /run/openrc 状态，然后原样重试上游一次。"
+    info "第一次日志已保存：$first_log"
+
+    detect_install_state
+    if [ "$INSTALL_STATE" = "partial" ]; then
+      backup_and_clear_partial_install
+    else
+      clear_openrc_runtime_state sing-box
+    fi
+
+    INSTALL_ATTEMPT=2
+    run_install
+    return $?
+  fi
+
+  print_install_failure_diagnostics
+  die "原版上游安装器返回错误码 $rc。请查看：$LOG_PATH"
 }
 
 service_is_running() {
@@ -1706,7 +1772,10 @@ backup_and_clear_partial_install() {
   info "停止可能残留的 sing-box 服务/进程。"
   if has rc-service; then
     rc-service sing-box stop >/dev/null 2>&1 || true
+    rc-service sing-box zap >/dev/null 2>&1 || true
   fi
+  clear_openrc_runtime_state sing-box
+
   if has rc-update; then
     rc-update del sing-box default >/dev/null 2>&1 || true
   fi
@@ -1747,6 +1816,10 @@ backup_and_clear_partial_install() {
     mv "$link" "${recovery_dir}/${safe_name}" 2>/dev/null || rm -f "$link"
     moved=$((moved + 1))
   done
+
+  # Remove transient OpenRC state once more after the init script and runlevel
+  # links have been moved out of the way.
+  clear_openrc_runtime_state sing-box
 
   if has systemctl; then
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1880,7 +1953,7 @@ main() {
       say "  SB_PROFILE=auto|lean|compat|custom|all"
       say "  SB_NAT_LIMITED=true|false"
       say
-      say "安装原则：原样执行官方 sing-box.sh；残留安装只做外部备份清理，不修改上游源码。"
+      say "安装原则：原样执行官方 sing-box.sh；仅清理外围 OpenRC 残留，最多自动重试一次。"
       exit 0
       ;;
     --auto-tcp|auto-tcp)
@@ -1936,7 +2009,7 @@ main() {
       say "  SB_PROFILE=auto|lean|compat|custom|all"
       say "  SB_NAT_LIMITED=true|false"
       say
-      say "安装原则：原样执行官方 sing-box.sh；残留安装只做外部备份清理，不修改上游源码。"
+      say "安装原则：原样执行官方 sing-box.sh；仅清理外围 OpenRC 残留，最多自动重试一次。"
       exit 0
       ;;
     install|"")
