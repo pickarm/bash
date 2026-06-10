@@ -1,18 +1,23 @@
 #!/usr/bin/env sh
-# sb-guide-optimized.sh
-# A lightweight, capability-aware guided wrapper for fscarmen/sing-box.
+# sb-guide-universal.sh
+# Universal, capability-aware wrapper for fscarmen/sing-box.
 #
 # Goals:
-# - Safe download and validation of the upstream installer
-# - Low-memory defaults for tiny Alpine/LXC/NAT VPS
-# - Guided protocol, port, node-name and subscription configuration
-# - Capability-aware BBR/fq tuning (no forced kernel replacement)
-# - Clear post-install verification
+# - Broad distro / VM / container compatibility
+# - Automatic resource classification and adaptive kernel tuning
+# - Explicit TCP-only or TCP+UDP protocol selection
+# - Safe BBR + fq activation when the running kernel supports them
+# - Upstream protocol-map verification before installation
+# - Guided mode plus unattended --auto-tcp / --auto-udp modes
+# - Configuration backup, validation and network rollback
 #
 # Usage:
-#   sh sb-guide-optimized.sh
-#   sh sb-guide-optimized.sh --net-only
-#   sh sb-guide-optimized.sh --check
+#   sh sb-guide-universal.sh
+#   sh sb-guide-universal.sh --auto-tcp
+#   sh sb-guide-universal.sh --auto-udp
+#   sh sb-guide-universal.sh --net-only
+#   sh sb-guide-universal.sh --rollback-net
+#   sh sb-guide-universal.sh --check
 #
 # Environment overrides:
 #   OFFICIAL_SCRIPT_URL=https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh
@@ -20,14 +25,21 @@
 
 set -u
 
-VERSION="2.0.0"
+VERSION="3.0.0-universal"
 OFFICIAL_SCRIPT_URL="${OFFICIAL_SCRIPT_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh}"
+OFFICIAL_CONFIG_URL="${OFFICIAL_CONFIG_URL:-https://raw.githubusercontent.com/fscarmen/sing-box/main/config.conf}"
 WORK_DIR="${WORK_DIR:-/root/.sb-guide}"
 OFFICIAL_SCRIPT_PATH="${WORK_DIR}/sing-box.sh"
+UPSTREAM_CONFIG_PATH="${WORK_DIR}/upstream-config.conf"
 CONFIG_PATH="${WORK_DIR}/config.conf"
 LOG_PATH="${WORK_DIR}/install.log"
 SYSCTL_PATH="/etc/sysctl.d/99-sb-guide-network.conf"
+NETWORK_STATE_PATH="${WORK_DIR}/network-before.conf"
 MODE="${1:-install}"
+AUTO_INSTALL="false"
+TRANSPORT_MODE="${SB_TRANSPORT_MODE:-}"
+PROTOCOL_PROFILE="${SB_PROFILE:-}"
+NAT_LIMITED="${SB_NAT_LIMITED:-}"
 
 if [ -t 1 ] 2>/dev/null; then
   RED="$(printf '\033[31m')"
@@ -82,6 +94,11 @@ ask() {
   prompt="$1"
   default="${2:-}"
 
+  if [ "$AUTO_INSTALL" = "true" ]; then
+    printf '%s' "$default"
+    return 0
+  fi
+
   if [ -n "$default" ]; then
     printf '%s [%s]: ' "$prompt" "$default" >&2
   else
@@ -99,6 +116,11 @@ ask() {
 confirm() {
   prompt="$1"
   default="${2:-y}"
+
+  if [ "$AUTO_INSTALL" = "true" ]; then
+    [ "$default" = "y" ]
+    return
+  fi
 
   if [ "$default" = "y" ]; then
     suffix="[Y/n]"
@@ -190,22 +212,49 @@ supported_upstream_os() {
 
 detect_resources() {
   MEM_MB=0
+  SWAP_MB=0
+  CPU_CORES=1
   DISK_FREE_MB=0
+  RESOURCE_CLASS="medium"
 
   if [ -r /proc/meminfo ]; then
     MEM_MB="$(awk '/MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || printf '0')"
+    SWAP_MB="$(awk '/SwapTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || printf '0')"
   fi
+
+  if has nproc; then
+    CPU_CORES="$(nproc 2>/dev/null || printf '1')"
+  elif [ -r /proc/cpuinfo ]; then
+    CPU_CORES="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || printf '1')"
+  fi
+  case "$CPU_CORES" in ""|*[!0-9]*) CPU_CORES=1 ;; esac
+  [ "$CPU_CORES" -ge 1 ] 2>/dev/null || CPU_CORES=1
 
   DISK_FREE_MB="$(df -Pm "$WORK_DIR" 2>/dev/null | awk 'NR==2 {print $4; exit}' || printf '0')"
   [ -n "$DISK_FREE_MB" ] || DISK_FREE_MB=0
 
-  info "内存：${MEM_MB} MB"
-  info "工作目录可用空间：${DISK_FREE_MB} MB"
+  if [ "$MEM_MB" -gt 0 ] 2>/dev/null && [ "$MEM_MB" -lt 256 ] 2>/dev/null; then
+    RESOURCE_CLASS="tiny"
+  elif [ "$MEM_MB" -lt 768 ] 2>/dev/null; then
+    RESOURCE_CLASS="small"
+  elif [ "$MEM_MB" -lt 2048 ] 2>/dev/null; then
+    RESOURCE_CLASS="medium"
+  elif [ "$MEM_MB" -lt 8192 ] 2>/dev/null; then
+    RESOURCE_CLASS="large"
+  else
+    RESOURCE_CLASS="xlarge"
+  fi
 
   LOW_MEMORY="false"
-  if [ "$MEM_MB" -gt 0 ] 2>/dev/null && [ "$MEM_MB" -lt 256 ] 2>/dev/null; then
-    LOW_MEMORY="true"
-    warn "这是低内存机器。默认只推荐 VLESS Reality，并关闭在线订阅/Nginx。"
+  [ "$RESOURCE_CLASS" = "tiny" ] && LOW_MEMORY="true"
+
+  info "CPU：${CPU_CORES} 核"
+  info "内存：${MEM_MB} MB（${RESOURCE_CLASS}）"
+  info "Swap：${SWAP_MB} MB"
+  info "工作目录可用空间：${DISK_FREE_MB} MB"
+
+  if [ "$LOW_MEMORY" = "true" ]; then
+    warn "低内存机器：将使用较小缓冲区，并默认关闭 Nginx/Argo。"
   fi
 
   if [ "$DISK_FREE_MB" -gt 0 ] 2>/dev/null && [ "$DISK_FREE_MB" -lt 180 ] 2>/dev/null; then
@@ -249,6 +298,112 @@ detect_virtualization() {
   info "虚拟化：$VIRT"
 }
 
+
+probe_udp_egress() {
+  UDP_PROBE_RESULT="unknown"
+
+  if has timeout && has dig; then
+    if timeout 5 dig +time=2 +tries=1 @1.1.1.1 example.com A >/dev/null 2>&1; then
+      UDP_PROBE_RESULT="available"
+      return 0
+    fi
+  fi
+
+  if has timeout && has nslookup; then
+    if timeout 5 nslookup example.com 1.1.1.1 >/dev/null 2>&1; then
+      UDP_PROBE_RESULT="available"
+      return 0
+    fi
+  fi
+
+  if has timeout && has nc; then
+    if timeout 4 nc -u -z -w 2 1.1.1.1 53 >/dev/null 2>&1; then
+      UDP_PROBE_RESULT="possibly-available"
+      return 0
+    fi
+  fi
+
+  UDP_PROBE_RESULT="unknown"
+  return 1
+}
+
+choose_transport_mode() {
+  case "$TRANSPORT_MODE" in
+    tcp|tcp-only)
+      TRANSPORT_MODE="tcp"
+      ;;
+    udp|tcp-udp|all)
+      TRANSPORT_MODE="udp"
+      ;;
+    auto|"")
+      if [ "$AUTO_INSTALL" = "true" ]; then
+        # Unattended generic mode is deliberately conservative.
+        TRANSPORT_MODE="tcp"
+      else
+        say
+        say "传输模式："
+        say "  1. 自动探测后确认（默认）"
+        say "  2. 仅 TCP：适合禁 UDP、严格防火墙或只映射 TCP 的机器"
+        say "  3. TCP + UDP：适合确认 UDP 入站端口可用的机器"
+        transport_choice="$(ask "请选择" "1")"
+
+        case "$transport_choice" in
+          2)
+            TRANSPORT_MODE="tcp"
+            ;;
+          3)
+            TRANSPORT_MODE="udp"
+            ;;
+          *)
+            info "正在进行轻量 UDP 出站探测；该探测不能证明 UDP 入站已放行。"
+            if probe_udp_egress; then
+              info "UDP 出站探测结果：$UDP_PROBE_RESULT"
+              if confirm "你是否确认 VPS 安全组、NAT 映射和防火墙允许 UDP 入站？" "n"; then
+                TRANSPORT_MODE="udp"
+              else
+                TRANSPORT_MODE="tcp"
+              fi
+            else
+              warn "无法确认 UDP 可用，自动选择仅 TCP。"
+              TRANSPORT_MODE="tcp"
+            fi
+            ;;
+        esac
+      fi
+      ;;
+    *)
+      die "SB_TRANSPORT_MODE 必须为 tcp、udp 或 auto。"
+      ;;
+  esac
+
+  if [ "$TRANSPORT_MODE" = "tcp" ]; then
+    ONLY_TCP="true"
+    UDP_ENABLED="false"
+    NAT_LIMITED="false"
+    ok "已选择：严格 TCP-only。"
+  else
+    ONLY_TCP="false"
+    UDP_ENABLED="true"
+
+    case "$NAT_LIMITED" in
+      true|yes|1) NAT_LIMITED="true" ;;
+      false|no|0) NAT_LIMITED="false" ;;
+      *)
+        if confirm "这是端口映射数量有限的 NAT VPS 吗？" "n"; then
+          NAT_LIMITED="true"
+        else
+          NAT_LIMITED="false"
+        fi
+        ;;
+    esac
+
+    ok "已选择：TCP + UDP。"
+    if [ "$NAT_LIMITED" = "true" ]; then
+      warn "NAT 限端口模式：自动关闭 Hysteria2 端口跳跃，并尽量减少协议端口。"
+    fi
+  fi
+}
+
 run_pkg() {
   info "执行：$*"
   sh -c "$*"
@@ -262,41 +417,41 @@ install_deps() {
     apt)
       export DEBIAN_FRONTEND=noninteractive
       run_pkg "apt-get update" || die "apt-get update 失败"
-      run_pkg "apt-get install -y --no-install-recommends bash curl wget ca-certificates tar gzip openssl iproute2 procps" ||
+      run_pkg "apt-get install -y --no-install-recommends bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool" ||
         die "依赖安装失败"
       ;;
     apk)
       run_pkg "apk update" || die "apk update 失败"
-      run_pkg "apk add --no-cache bash curl wget ca-certificates tar gzip openssl iproute2 procps-ng openrc" ||
+      run_pkg "apk add --no-cache bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool-ng openrc ethtool" ||
         die "依赖安装失败"
       update-ca-certificates >/dev/null 2>&1 || true
       ;;
     dnf)
-      run_pkg "dnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng" ||
+      run_pkg "dnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool" ||
         die "依赖安装失败"
       ;;
     yum)
-      if ! run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng"; then
+      if ! run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool"; then
         run_pkg "yum install -y epel-release" || true
-        run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng" ||
+        run_pkg "yum install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool" ||
           die "依赖安装失败"
       fi
       ;;
     microdnf)
-      run_pkg "microdnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng" ||
+      run_pkg "microdnf install -y bash curl wget ca-certificates tar gzip openssl iproute procps-ng ethtool" ||
         die "依赖安装失败"
       ;;
     pacman)
-      run_pkg "pacman -Sy --noconfirm --needed bash curl wget ca-certificates tar gzip openssl iproute2 procps-ng" ||
+      run_pkg "pacman -Sy --noconfirm --needed bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool-ng" ||
         die "依赖安装失败"
       ;;
     zypper)
       run_pkg "zypper --non-interactive refresh" || true
-      run_pkg "zypper --non-interactive install bash curl wget ca-certificates tar gzip openssl iproute2 procps" ||
+      run_pkg "zypper --non-interactive install bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool" ||
         die "依赖安装失败"
       ;;
     xbps)
-      run_pkg "xbps-install -Sy bash curl wget ca-certificates tar gzip openssl iproute2 procps-ng" ||
+      run_pkg "xbps-install -Sy bash curl wget ca-certificates tar gzip openssl iproute2 procps ethtool-ng" ||
         die "依赖安装失败"
       ;;
     opkg)
@@ -352,6 +507,26 @@ fetch_file() {
   }
 
   mv "$tmp" "$out"
+}
+
+
+verify_upstream_protocol_map() {
+  info "核对上游协议字母映射：$OFFICIAL_CONFIG_URL"
+
+  fetch_file "$OFFICIAL_CONFIG_URL" "$UPSTREAM_CONFIG_PATH" ||
+    die "无法下载上游 config.conf，不能安全确认协议映射。"
+
+  map_ok="true"
+  grep -Eiq 'b:[[:space:]]*VLESS[[:space:]]*\+[[:space:]]*Reality' "$UPSTREAM_CONFIG_PATH" || map_ok="false"
+  grep -Eiq 'c:[[:space:]]*Hysteria2' "$UPSTREAM_CONFIG_PATH" || map_ok="false"
+  grep -Eiq 'd:[[:space:]]*(Tuic|TUIC)[[:space:]]*V5' "$UPSTREAM_CONFIG_PATH" || map_ok="false"
+  grep -Eiq 'g:[[:space:]]*Trojan' "$UPSTREAM_CONFIG_PATH" || map_ok="false"
+  grep -Eiq 'l:[[:space:]]*AnyTLS' "$UPSTREAM_CONFIG_PATH" || map_ok="false"
+
+  [ "$map_ok" = "true" ] ||
+    die "上游协议字母映射已变化。为避免装错协议，本脚本已停止。"
+
+  ok "上游协议映射核对通过。"
 }
 
 valid_ip_like() {
@@ -469,7 +644,9 @@ validate_protocols() {
   fi
 
   if [ "$only_tcp" = "true" ]; then
-    case "$protocols" in *a*|*c*|*d*|*m*) return 2 ;; esac
+    # Strict TCP mode excludes QUIC-native c/d, Shadowsocks f (can expose UDP),
+    # and Naive m (upstream output may include QUIC).
+    case "$protocols" in *a*|*c*|*d*|*f*|*m*) return 2 ;; esac
   fi
   return 0
 }
@@ -492,25 +669,25 @@ count_protocols() {
 print_protocol_menu() {
   cat <<'EOF'
 
-协议映射（上游 config.conf）：
+协议映射（运行前会与上游 config.conf 自动核对）：
   a = 全部协议
-  b = VLESS + Reality
-  c = Hysteria2                 UDP/QUIC
-  d = TUIC v5                   UDP/QUIC
-  e = ShadowTLS
-  f = Shadowsocks
-  g = Trojan
-  h = VMess + WebSocket
-  i = VLESS + WebSocket + TLS
-  j = VLESS + H2 + Reality
-  k = VLESS + gRPC + Reality
-  l = AnyTLS
-  m = NaiveProxy                同时涉及 HTTP/2/QUIC 输出
+  b = VLESS + Reality / XTLS Vision       TCP，默认高速主协议
+  c = Hysteria2                           UDP / QUIC
+  d = TUIC v5                             UDP / QUIC
+  e = ShadowTLS                           TCP
+  f = Shadowsocks                         TCP/UDP 能力
+  g = Trojan                              TCP
+  h = VMess + WebSocket                   TCP，需要域名/Argo
+  i = VLESS + WebSocket + TLS             TCP，需要域名/Argo
+  j = VLESS + H2 + Reality                TCP
+  k = VLESS + gRPC + Reality              TCP
+  l = AnyTLS                              TCP
+  m = NaiveProxy                          可能包含 HTTP/2 / QUIC 输出
 
-建议：
-  低内存/禁用 UDP：b
-  普通 TCP 兼容：bgl
-  不建议在 128 MB 机器上一次安装很多协议。
+自动推荐策略：
+  仅 TCP：优先 b，避免无意义的多层封装。
+  TCP+UDP：b 作为稳定后备，c 作为高吞吐 UDP 主协议；
+           资源充足时加入 d，提升客户端选择空间。
 
 EOF
 }
@@ -537,41 +714,96 @@ check_ports() {
 }
 
 choose_protocols() {
+  [ -n "${TRANSPORT_MODE:-}" ] || choose_transport_mode
   print_protocol_menu
 
-  if [ "$LOW_MEMORY" = "true" ]; then
-    default_profile="1"
-  else
-    default_profile="2"
+  if [ -z "$PROTOCOL_PROFILE" ]; then
+    if [ "$AUTO_INSTALL" = "true" ]; then
+      PROTOCOL_PROFILE="auto"
+    else
+      say "协议配置档："
+      say "  1. 自动推荐：按内存、CPU、UDP 和 NAT 情况选择（默认）"
+      say "  2. 极简高速：TCP=b；允许 UDP 时=b+c"
+      say "  3. 多客户端兼容：TCP=b+g+l；允许 UDP 时=b+c+d+g+l"
+      say "  4. 自定义协议字母"
+      say "  5. 全协议（不推荐）"
+      profile_choice="$(ask "请选择" "1")"
+      case "$profile_choice" in
+        2) PROTOCOL_PROFILE="lean" ;;
+        3) PROTOCOL_PROFILE="compat" ;;
+        4) PROTOCOL_PROFILE="custom" ;;
+        5) PROTOCOL_PROFILE="all" ;;
+        *) PROTOCOL_PROFILE="auto" ;;
+      esac
+    fi
   fi
 
-  say "配置档："
-  say "  1. 轻量单协议：VLESS Reality（推荐小鸡）"
-  say "  2. TCP 兼容：Reality + Trojan + AnyTLS"
-  say "  3. 自定义协议字母"
-  say "  4. 全协议（不推荐低配置机器）"
-
-  profile="$(ask "请选择配置档" "$default_profile")"
-  case "$profile" in
-    1)
-      ONLY_TCP="true"
-      PROTOCOLS="b"
+  case "$PROTOCOL_PROFILE" in
+    auto)
+      if [ "$ONLY_TCP" = "true" ]; then
+        PROTOCOLS="b"
+        PROFILE_REASON="TCP-only：Reality 开销低、无域名要求、兼容性好"
+      else
+        case "$RESOURCE_CLASS" in
+          tiny|small)
+            PROTOCOLS="bc"
+            PROFILE_REASON="资源较小：Reality 后备 + Hysteria2 高吞吐"
+            ;;
+          medium)
+            if [ "$NAT_LIMITED" = "true" ]; then
+              PROTOCOLS="bc"
+              PROFILE_REASON="NAT 端口有限：仅保留 Reality + Hysteria2"
+            else
+              PROTOCOLS="bcd"
+              PROFILE_REASON="资源适中：Reality + Hysteria2 + TUIC"
+            fi
+            ;;
+          large|xlarge)
+            if [ "$NAT_LIMITED" = "true" ]; then
+              PROTOCOLS="bcd"
+              PROFILE_REASON="资源充足但 NAT 端口有限：三种核心协议"
+            else
+              PROTOCOLS="bcdl"
+              PROFILE_REASON="资源充足：核心 TCP/UDP 协议并加入 AnyTLS 后备"
+            fi
+            ;;
+          *)
+            PROTOCOLS="bc"
+            PROFILE_REASON="通用安全推荐"
+            ;;
+        esac
+      fi
       ;;
-    2)
-      ONLY_TCP="true"
-      PROTOCOLS="bgl"
+    lean)
+      if [ "$ONLY_TCP" = "true" ]; then
+        PROTOCOLS="b"
+      else
+        PROTOCOLS="bc"
+      fi
+      PROFILE_REASON="极简高速配置"
       ;;
-    4)
-      ONLY_TCP="false"
-      PROTOCOLS="a"
+    compat)
+      if [ "$ONLY_TCP" = "true" ]; then
+        PROTOCOLS="bgl"
+      else
+        PROTOCOLS="bcdgl"
+      fi
+      PROFILE_REASON="多客户端兼容配置"
       ;;
-    *)
-      if confirm "是否限制为 TCP 类协议？" "y"; then
-        ONLY_TCP="true"
+    all)
+      if [ "$ONLY_TCP" = "true" ]; then
+        warn "严格 TCP 模式不能选择全部协议，自动改为 bgl。"
+        PROTOCOLS="bgl"
+      else
+        PROTOCOLS="a"
+      fi
+      PROFILE_REASON="全部协议"
+      ;;
+    custom)
+      if [ "$ONLY_TCP" = "true" ]; then
         default_protocols="b"
       else
-        ONLY_TCP="false"
-        default_protocols="a"
+        default_protocols="bc"
       fi
 
       while :; do
@@ -582,15 +814,24 @@ choose_protocols() {
         if [ "$rc" -eq 0 ]; then
           break
         elif [ "$rc" -eq 2 ]; then
-          warn "TCP-only 不允许 a/c/d/m。"
+          warn "严格 TCP 模式不能使用 a/c/d/f/m。"
         else
           warn "协议组合无效；a 不能与其他字母混用。"
         fi
       done
+      PROFILE_REASON="用户自定义"
+      ;;
+    *)
+      die "SB_PROFILE 必须为 auto、lean、compat、custom 或 all。"
       ;;
   esac
 
-  info "将安装协议：$PROTOCOLS"
+  validate_protocols "$PROTOCOLS" "$ONLY_TCP" ||
+    die "自动生成的协议组合未通过校验：$PROTOCOLS"
+
+  info "自动评估：CPU=${CPU_CORES}核，内存=${MEM_MB}MB，资源级别=${RESOURCE_CLASS}"
+  info "协议选择：$PROTOCOLS"
+  info "选择原因：$PROFILE_REASON"
 }
 
 interactive_config() {
@@ -601,6 +842,8 @@ interactive_config() {
 
   LANGUAGE="$(ask "语言：c=中文，e=英文" "c")"
   case "$LANGUAGE" in c|e) ;; *) LANGUAGE="c" ;; esac
+
+  [ -n "${TRANSPORT_MODE:-}" ] || choose_transport_mode
 
   detect_server_ip
   SERVER_IP="$(ask "服务器公网 IP/IPv6" "$DETECTED_IP")"
@@ -631,7 +874,7 @@ interactive_config() {
   [ -n "$UUID_CONFIRM" ] || UUID_CONFIRM="$(gen_uuid)"
   valid_uuid "$UUID_CONFIRM" || die "UUID 格式无效。"
 
-  if [ "$LOW_MEMORY" = "true" ]; then
+  if [ "$AUTO_INSTALL" = "true" ] || [ "$LOW_MEMORY" = "true" ]; then
     sub_default="n"
   else
     sub_default="y"
@@ -682,8 +925,10 @@ interactive_config() {
   HY2_WARP=""
 
   if contains_char "$PROTOCOLS" "c" || [ "$PROTOCOLS" = "a" ]; then
-    warn "Hysteria2 依赖 UDP/QUIC；禁用 UDP 的机器不能使用。"
-    if confirm "启用 Hysteria2 端口跳跃？" "n"; then
+    warn "Hysteria2 依赖 UDP/QUIC，请确认对应 UDP 公网端口已放行。"
+    if [ "$NAT_LIMITED" = "true" ]; then
+      info "NAT 限端口模式：不启用 Hysteria2 端口跳跃。"
+    elif confirm "启用 Hysteria2 端口跳跃？" "n"; then
       HY2_PORT_HOPPING_RANGE="$(ask "端口范围，例如 50000:51000" "50000:51000")"
     fi
     if confirm "启用 Hysteria2 Realm？" "n"; then
@@ -708,7 +953,9 @@ interactive_config() {
   say "服务器地址：$SERVER_IP"
   say "节点名：$NODE_NAME"
   say "协议：$PROTOCOLS"
+  say "传输模式：$TRANSPORT_MODE"
   say "TCP-only：$ONLY_TCP"
+  say "NAT 限端口：$NAT_LIMITED"
   say "端口：${START_PORT}-${end_port}"
   say "UUID：$(redact "$UUID_CONFIRM")"
   say "在线订阅：$SUBSCRIBE"
@@ -817,6 +1064,41 @@ find_singbox_binary() {
   return 1
 }
 
+
+tune_service_limits() {
+  case "$RESOURCE_CLASS" in
+    tiny) NOFILE_LIMIT=65535 ;;
+    small) NOFILE_LIMIT=131072 ;;
+    medium) NOFILE_LIMIT=262144 ;;
+    large|xlarge) NOFILE_LIMIT=524288 ;;
+    *) NOFILE_LIMIT=131072 ;;
+  esac
+
+  if has systemctl && systemctl cat sing-box.service >/dev/null 2>&1; then
+    override_dir="/etc/systemd/system/sing-box.service.d"
+    mkdir -p "$override_dir" || return 0
+    cat > "${override_dir}/99-sb-guide-limits.conf" <<EOF
+[Service]
+LimitNOFILE=${NOFILE_LIMIT}
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart sing-box >/dev/null 2>&1 || true
+    ok "systemd sing-box 文件句柄上限：$NOFILE_LIMIT"
+    return 0
+  fi
+
+  if has rc-service && [ -f /etc/init.d/sing-box ]; then
+    conf="/etc/conf.d/sing-box"
+    touch "$conf" 2>/dev/null || return 0
+    tmp_conf="${conf}.tmp.$$"
+    grep -v '^[[:space:]]*rc_ulimit=' "$conf" > "$tmp_conf" 2>/dev/null || true
+    printf 'rc_ulimit="-n %s"\n' "$NOFILE_LIMIT" >> "$tmp_conf"
+    mv "$tmp_conf" "$conf"
+    rc-service sing-box restart >/dev/null 2>&1 || true
+    ok "OpenRC sing-box 文件句柄上限：$NOFILE_LIMIT"
+  fi
+}
+
 post_check() {
   say
   say "------------- 安装验证 -------------"
@@ -917,10 +1199,100 @@ apply_one_sysctl() {
   return 1
 }
 
+
+snapshot_network_state() {
+  # Keep the first pre-tuning state so --rollback-net can restore it.
+  [ -s "$NETWORK_STATE_PATH" ] && return 0
+
+  umask 077
+  : > "$NETWORK_STATE_PATH"
+
+  for key in \
+    net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.core.rmem_default \
+    net.core.wmem_default \
+    net.core.optmem_max \
+    net.core.netdev_max_backlog \
+    net.core.somaxconn \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_max_syn_backlog \
+    net.ipv4.tcp_fastopen \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_slow_start_after_idle \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_sack \
+    net.ipv4.tcp_timestamps \
+    net.ipv4.tcp_syncookies \
+    net.ipv4.tcp_moderate_rcvbuf \
+    net.ipv4.tcp_autocorking \
+    net.ipv4.tcp_early_retrans \
+    net.ipv4.tcp_recovery \
+    net.ipv4.udp_rmem_min \
+    net.ipv4.udp_wmem_min \
+    net.ipv4.tcp_retries2 \
+    net.ipv4.tcp_fin_timeout \
+    net.ipv4.tcp_keepalive_time \
+    net.ipv4.tcp_keepalive_intvl \
+    net.ipv4.tcp_keepalive_probes \
+    net.ipv4.ip_local_port_range \
+    fs.file-max
+  do
+    if sysctl_key_exists "$key"; then
+      value="$(sysctl -n "$key" 2>/dev/null || true)"
+      [ -n "$value" ] && printf '%s=%s\n' "$key" "$value" >> "$NETWORK_STATE_PATH"
+    fi
+  done
+
+  chmod 600 "$NETWORK_STATE_PATH" 2>/dev/null || true
+  ok "已保存优化前参数：$NETWORK_STATE_PATH"
+}
+
+rollback_network() {
+  need_root
+  prepare_workdir
+
+  if [ ! -s "$NETWORK_STATE_PATH" ]; then
+    die "找不到优化前参数快照：$NETWORK_STATE_PATH"
+  fi
+
+  warn "正在恢复优化前的 sysctl 参数。"
+  while IFS= read -r line; do
+    case "$line" in
+      ""|\#*) continue ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    if sysctl_key_exists "$key"; then
+      if sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+        ok "已恢复：$key=$value"
+      else
+        warn "恢复失败：$key"
+      fi
+    fi
+  done < "$NETWORK_STATE_PATH"
+
+  rm -f "$SYSCTL_PATH"
+
+  # Remove the explicitly attached root qdisc, allowing the interface/kernel
+  # default to take over again. This is best-effort.
+  if has ip && has tc; then
+    main_if="$(ip -4 route get 1.1.1.1 2>/dev/null |
+      awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')"
+    [ -n "$main_if" ] && tc qdisc del dev "$main_if" root >/dev/null 2>&1 || true
+  fi
+
+  ok "回滚完成。持久化文件已移除：$SYSCTL_PATH"
+  show_network_status
+}
+
 network_optimize() {
   say
   say "======================================"
-  say " 网络能力检测与安全优化"
+  say " 自适应网络优化：BBR / FQ / TCP / UDP"
   say "======================================"
 
   has sysctl || {
@@ -929,45 +1301,166 @@ network_optimize() {
     return
   }
 
+  [ -n "${TRANSPORT_MODE:-}" ] || choose_transport_mode
   detect_virtualization
+  detect_resources
   show_network_status
 
   available="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
 
-  if ! printf '%s\n' "$available" | grep -qw bbr; then
+  if ! printf '%s
+' "$available" | grep -qw bbr; then
     if [ "$IS_CONTAINER" = "false" ] && has modprobe; then
       modprobe tcp_bbr >/dev/null 2>&1 || true
       available="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
     fi
   fi
 
+  snapshot_network_state
+
   temp_sysctl="${WORK_DIR}/sysctl.$$"
   : > "$temp_sysctl"
 
-  # BBR can only be selected if the running host kernel exposes it.
-  if printf '%s\n' "$available" | grep -qw bbr; then
+  # BBR/FQ applies to TCP. QUIC protocols maintain their own user-space CC.
+  if printf '%s
+' "$available" | grep -qw bbr; then
     apply_one_sysctl "net.ipv4.tcp_congestion_control" "bbr" "$temp_sysctl" || true
+  elif printf '%s
+' "$available" | grep -qw cubic; then
+    apply_one_sysctl "net.ipv4.tcp_congestion_control" "cubic" "$temp_sysctl" || true
+    warn "运行内核没有注册 BBR，已使用 CUBIC。"
   else
-    warn "当前运行内核没有提供 BBR。"
-    if [ "$IS_CONTAINER" = "true" ]; then
-      warn "LXC/OpenVZ/Docker 不能在容器内更换宿主内核；请让商家在宿主机启用 BBR。"
-    else
-      warn "本脚本不会自动替换内核。先升级发行版官方内核，再重新运行 --net-only。"
-    fi
+    warn "运行内核没有 BBR/CUBIC 可供选择，保留当前拥塞控制。"
   fi
 
-  # On veth/container interfaces default_qdisc is commonly ignored/noqueue.
-  if [ "$IS_CONTAINER" = "false" ]; then
-    if has modprobe; then
-      modprobe sch_fq >/dev/null 2>&1 || true
-    fi
-    apply_one_sysctl "net.core.default_qdisc" "fq" "$temp_sysctl" || true
-  else
-    warn "容器环境跳过 default_qdisc=fq：veth 的实际队列通常由宿主机控制。"
+  case "$RESOURCE_CLASS" in
+    tiny)
+      BUF_MAX=8388608
+      UDP_DEFAULT=131072
+      BACKLOG=4096
+      SOMAX=4096
+      FILE_MAX=131072
+      ;;
+    small)
+      BUF_MAX=16777216
+      UDP_DEFAULT=262144
+      BACKLOG=8192
+      SOMAX=8192
+      FILE_MAX=262144
+      ;;
+    medium)
+      BUF_MAX=33554432
+      UDP_DEFAULT=524288
+      BACKLOG=16384
+      SOMAX=16384
+      FILE_MAX=524288
+      ;;
+    large)
+      BUF_MAX=67108864
+      UDP_DEFAULT=1048576
+      BACKLOG=32768
+      SOMAX=32768
+      FILE_MAX=1048576
+      ;;
+    xlarge)
+      BUF_MAX=134217728
+      UDP_DEFAULT=2097152
+      BACKLOG=65536
+      SOMAX=65535
+      FILE_MAX=2097152
+      ;;
+    *)
+      BUF_MAX=33554432
+      UDP_DEFAULT=524288
+      BACKLOG=16384
+      SOMAX=16384
+      FILE_MAX=524288
+      ;;
+  esac
+
+  # Scale packet backlog on multi-core machines without making tiny nodes absurd.
+  if [ "$CPU_CORES" -ge 8 ] 2>/dev/null && [ "$BACKLOG" -lt 65536 ] 2>/dev/null; then
+    BACKLOG=$((BACKLOG * 2))
+    [ "$BACKLOG" -le 65536 ] || BACKLOG=65536
+  elif [ "$CPU_CORES" -ge 4 ] 2>/dev/null && [ "$BACKLOG" -lt 32768 ] 2>/dev/null; then
+    BACKLOG=$((BACKLOG + BACKLOG / 2))
+    [ "$BACKLOG" -le 32768 ] || BACKLOG=32768
   fi
 
-  # Conservative resilience setting; no large memory buffers on tiny VPS.
+  info "资源级别：$RESOURCE_CLASS"
+  info "TCP 自动缓冲上限：$((BUF_MAX / 1024 / 1024)) MiB"
+  info "netdev backlog：$BACKLOG"
+  info "文件句柄总上限：$FILE_MAX"
+
+  apply_one_sysctl "net.core.rmem_max" "$BUF_MAX" "$temp_sysctl" || true
+  apply_one_sysctl "net.core.wmem_max" "$BUF_MAX" "$temp_sysctl" || true
+  apply_one_sysctl "net.core.optmem_max" "65536" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_rmem" "4096 131072 $BUF_MAX" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_wmem" "4096 65536 $BUF_MAX" "$temp_sysctl" || true
+  apply_one_sysctl "net.core.netdev_max_backlog" "$BACKLOG" "$temp_sysctl" || true
+  apply_one_sysctl "net.core.somaxconn" "$SOMAX" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_max_syn_backlog" "$SOMAX" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_fastopen" "3" "$temp_sysctl" || true
   apply_one_sysctl "net.ipv4.tcp_mtu_probing" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_slow_start_after_idle" "0" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_window_scaling" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_sack" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_timestamps" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_syncookies" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_moderate_rcvbuf" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_autocorking" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_early_retrans" "3" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.tcp_recovery" "1" "$temp_sysctl" || true
+  apply_one_sysctl "net.ipv4.ip_local_port_range" "10240 65535" "$temp_sysctl" || true
+  apply_one_sysctl "fs.file-max" "$FILE_MAX" "$temp_sysctl" || true
+
+  if [ "$UDP_ENABLED" = "true" ]; then
+    info "正在应用 UDP/QUIC 自适应缓冲配置。"
+    apply_one_sysctl "net.core.rmem_default" "$UDP_DEFAULT" "$temp_sysctl" || true
+    apply_one_sysctl "net.core.wmem_default" "$UDP_DEFAULT" "$temp_sysctl" || true
+    apply_one_sysctl "net.ipv4.udp_rmem_min" "16384" "$temp_sysctl" || true
+    apply_one_sysctl "net.ipv4.udp_wmem_min" "16384" "$temp_sysctl" || true
+  fi
+
+  # Set fq as the default where possible. veth devices may still show noqueue.
+  if has modprobe && [ "$IS_CONTAINER" = "false" ]; then
+    modprobe sch_fq >/dev/null 2>&1 || true
+  fi
+  apply_one_sysctl "net.core.default_qdisc" "fq" "$temp_sysctl" || true
+
+  if [ "$IS_CONTAINER" = "false" ] && has ip && has tc; then
+    MAIN_IF="$(ip -4 route get 1.1.1.1 2>/dev/null |
+      awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')"
+    if [ -n "$MAIN_IF" ]; then
+      if tc qdisc replace dev "$MAIN_IF" root fq >/dev/null 2>&1; then
+        ok "当前接口 $MAIN_IF 已应用 fq。"
+      else
+        warn "无法在接口 $MAIN_IF 直接应用 fq；保留内核/虚拟化平台的队列。"
+      fi
+    fi
+  else
+    warn "容器环境不强改 veth 根 qdisc；宿主机可能显示 noqueue。"
+  fi
+
+  # Keep common offloads enabled when the virtual/physical NIC allows it.
+  if [ "$IS_CONTAINER" = "false" ] && has ethtool && has ip; then
+    MAIN_IF="$(ip -4 route get 1.1.1.1 2>/dev/null |
+      awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')"
+    if [ -n "$MAIN_IF" ]; then
+      ethtool -K "$MAIN_IF" gro on gso on tso on >/dev/null 2>&1 || true
+      info "已尝试保持 $MAIN_IF 的 GRO/GSO/TSO 开启。"
+    fi
+  fi
+
+  governor_changed="false"
+  for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -e "$governor" ] || continue
+    if printf 'performance
+' > "$governor" 2>/dev/null; then
+      governor_changed="true"
+    fi
+  done
+  [ "$governor_changed" = "true" ] && ok "CPU governor 已切换为 performance。"
 
   if [ -s "$temp_sysctl" ]; then
     if [ -f "$SYSCTL_PATH" ]; then
@@ -976,13 +1469,16 @@ network_optimize() {
       info "旧配置已备份：$backup"
     fi
     {
-      printf '# Managed by sb-guide-optimized.sh v%s\n' "$VERSION"
+      printf '# Managed by sb-guide-universal.sh v%s
+' "$VERSION"
+      printf '# Resource class: %s; transport: %s
+' "$RESOURCE_CLASS" "$TRANSPORT_MODE"
       cat "$temp_sysctl"
     } > "$SYSCTL_PATH"
     chmod 644 "$SYSCTL_PATH" 2>/dev/null || true
     ok "持久化网络配置：$SYSCTL_PATH"
   else
-    warn "没有任何网络参数成功写入。"
+    warn "没有网络参数成功写入。"
   fi
 
   rm -f "$temp_sysctl"
@@ -992,12 +1488,19 @@ network_optimize() {
   if [ "$current" = "bbr" ]; then
     ok "BBR 已对新建 TCP 连接生效。"
   else
-    warn "当前 TCP 拥塞控制仍为：${current:-未知}"
+    warn "当前 TCP 拥塞控制：${current:-未知}"
   fi
 
-  say
-  warn "网络算法不能修复差线路、宿主超售、端口限速或 NAT 映射问题。"
-  warn "本脚本不会设置超大 TCP 缓冲区，也不会在 LXC 内强装内核模块。"
+  if [ "$UDP_ENABLED" = "true" ]; then
+    info "Hysteria2/TUIC 的 QUIC 拥塞控制位于应用层；系统 BBR 主要优化 TCP 协议。"
+  fi
+
+  if [ "$IS_CONTAINER" = "true" ] && ! printf '%s
+' "$available" | grep -qw bbr; then
+    warn "容器无法自行替换宿主内核；若要 BBR，需要商家宿主提供或更换 KVM。"
+  fi
+
+  warn "脚本不能突破商家端口限速、CPU 配额、共享带宽或线路本身的物理上限。"
 }
 
 handle_existing_install() {
@@ -1046,10 +1549,44 @@ print_summary() {
   say
   say "网络复查："
   say "  sh $0 --check"
+  say "  sh $0 --auto-tcp"
+  say "  sh $0 --auto-udp"
   say "  sh $0 --net-only"
+  say "  sh $0 --rollback-net"
 }
 
 main() {
+  case "$MODE" in
+    --help|-h|help)
+      say "用法："
+      say "  sh $0                 引导式自动安装"
+      say "  sh $0 --auto-tcp      无人值守：仅 TCP，自动选择 Reality"
+      say "  sh $0 --auto-udp      无人值守：确认 UDP 入站可用，自动选择 TCP+UDP 协议"
+      say "  sh $0 --net-only      只应用自适应 BBR/FQ/TCP/UDP 优化"
+      say "  sh $0 --rollback-net  恢复首次优化前参数"
+      say "  sh $0 --check         只查看网络状态"
+      say
+      say "环境变量："
+      say "  SB_TRANSPORT_MODE=tcp|udp|auto"
+      say "  SB_PROFILE=auto|lean|compat|custom|all"
+      say "  SB_NAT_LIMITED=true|false"
+      exit 0
+      ;;
+    --auto-tcp|auto-tcp)
+      AUTO_INSTALL="true"
+      TRANSPORT_MODE="tcp"
+      PROTOCOL_PROFILE="auto"
+      MODE="install"
+      ;;
+    --auto-udp|auto-udp)
+      AUTO_INSTALL="true"
+      TRANSPORT_MODE="udp"
+      PROTOCOL_PROFILE="auto"
+      NAT_LIMITED="${NAT_LIMITED:-false}"
+      MODE="install"
+      ;;
+  esac
+
   need_root
   prepare_workdir
   detect_os
@@ -1066,14 +1603,27 @@ main() {
       if ! has sysctl; then
         install_deps
       fi
+      choose_transport_mode
       network_optimize
+      exit 0
+      ;;
+    --rollback-net|rollback-net)
+      rollback_network
       exit 0
       ;;
     --help|-h|help)
       say "用法："
-      say "  sh $0              安装 sing-box"
-      say "  sh $0 --net-only   只检测并安全启用 BBR/fq"
-      say "  sh $0 --check      只查看网络状态"
+      say "  sh $0                 引导式自动安装"
+      say "  sh $0 --auto-tcp      无人值守：仅 TCP，自动选择 Reality"
+      say "  sh $0 --auto-udp      无人值守：确认 UDP 入站可用，自动选择 TCP+UDP 协议"
+      say "  sh $0 --net-only      只应用自适应 BBR/FQ/TCP/UDP 优化"
+      say "  sh $0 --rollback-net  恢复首次优化前参数"
+      say "  sh $0 --check         只查看网络状态"
+      say
+      say "环境变量："
+      say "  SB_TRANSPORT_MODE=tcp|udp|auto"
+      say "  SB_PROFILE=auto|lean|compat|custom|all"
+      say "  SB_NAT_LIMITED=true|false"
       exit 0
       ;;
     install|"")
@@ -1097,7 +1647,10 @@ main() {
     fi
   fi
 
-  if confirm "安装前执行网络能力检测并安全启用 BBR（若宿主支持）？" "y"; then
+  verify_upstream_protocol_map
+  choose_transport_mode
+
+  if confirm "安装前应用自适应 BBR/FQ 与 TCP/UDP 网络优化？" "y"; then
     network_optimize
   fi
 
@@ -1105,6 +1658,7 @@ main() {
   write_config
   download_official_script
   run_install
+  tune_service_limits
   post_check
   export_nodes
   print_summary
